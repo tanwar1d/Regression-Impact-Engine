@@ -1,0 +1,355 @@
+import streamlit as st
+import pandas as pd
+import re
+from collections import Counter
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
+st.set_page_config(layout="wide", page_title="Regression Intelligence")
+st.title("🧠 Regression Intelligence Engine")
+
+# ================= MODEL =================
+
+@st.cache_resource
+def load_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+model = load_model()
+
+# ================= SESSION STATE =================
+
+defaults = {
+    "dark": False,
+    "use_bugs": False,
+    "manual_mode": False,
+    "manual_keywords": [],
+    "priority": [],
+    "gaps": [],
+    "related_bugs": [],
+    "manual_input": ""
+}
+
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+dark = st.sidebar.toggle("🌙 Dark Mode", key="dark")
+threshold = st.sidebar.slider("Priority Threshold %", 0, 100, 35, 5)
+use_bugs = st.sidebar.toggle("🐞 Boost using Sprint Bugs", key="use_bugs")
+manual_mode = st.sidebar.toggle("🖐 Manual Prioritize", key="manual_mode")
+
+# ================= STYLE =================
+
+if dark:
+    bg = "#0e1117"
+    card_bg = "#1c1f26"
+    text_color = "white"
+else:
+    bg = "#f5f7fb"
+    card_bg = "white"
+    text_color = "black"
+
+st.markdown(f"""
+<style>
+.stApp {{ background:{bg}; color:{text_color}; }}
+
+.card {{
+    background:{card_bg};
+    padding:16px;
+    border-radius:14px;
+    margin-bottom:14px;
+    box-shadow:0 4px 14px rgba(0,0,0,0.08);
+}}
+
+.score-pill {{
+    padding:4px 12px;
+    border-radius:999px;
+    font-size:12px;
+    font-weight:600;
+    float:right;
+}}
+
+.progress-bar {{
+    height:6px;
+    border-radius:6px;
+    margin-top:8px;
+}}
+
+mark {{
+    background:#22c55e;
+    color:black;
+    padding:2px 4px;
+    border-radius:4px;
+}}
+
+/* DARK MODE FIXES ONLY */
+
+.stButton > button {{
+    background:#1c1f26 !important;
+    color:white !important;
+    border:1px solid #2d3748 !important;
+}}
+
+.stButton > button:hover {{
+    background:#2a2f3a !important;
+}}
+
+section[data-testid="stFileUploader"] {{
+    background:#1c1f26 !important;
+    border:1px solid #2d3748 !important;
+    border-radius:10px;
+    padding:10px;
+}}
+
+section[data-testid="stFileUploader"] span {{
+    color:white !important;
+}}
+
+section[data-testid="stFileUploader"] button {{
+    background:#1c1f26 !important;
+    color:white !important;
+    border:1px solid #2d3748 !important;
+}}
+
+</style>
+""", unsafe_allow_html=True)
+
+# ================= HELPERS =================
+
+def clean(t):
+    return re.sub(r"[^a-z0-9\s]", " ", str(t).lower())
+
+def keywords(text):
+    return [w for w in clean(text).split() if len(w) > 3]
+
+def highlight_manual(text):
+    for w in st.session_state.manual_keywords:
+        text = re.sub(fr"(?i)({re.escape(w)})", r"<mark>\1</mark>", text)
+    return text
+
+def load_file(f):
+    return pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
+
+def load_tests(f):
+    df = load_file(f)
+    return [{"id": r["Issue key"], "text": str(r["Summary"])} for _, r in df.iterrows()]
+
+def load_bugs(f):
+    if not f:
+        return []
+    df = load_file(f)
+    return [{"id": r["Issue key"], "text": str(r["Summary"])} for _, r in df.iterrows()]
+
+def semantic_rank(story, tests):
+    emb = model.encode([story] + [t["text"] for t in tests])
+    sims = cosine_similarity([emb[0]], emb[1:])[0]
+
+    for i, s in enumerate(sims):
+        tests[i]["semantic"] = float(s * 100)
+        tests[i]["bug"] = 0
+        tests[i]["manual"] = 0
+        tests[i]["kw"] = 0
+
+    return tests
+
+def extract_focus_terms(text):
+    return Counter(keywords(text))
+
+def keyword_score(test_text, focus_terms):
+    score = 0
+    for k, freq in focus_terms.items():
+        if k in test_text.lower():
+            score += freq
+    return min(score * 2, 40)
+
+def bug_score(test_text, bug_texts):
+    bug_words = set(keywords(" ".join(bug_texts)))
+    overlap = set(keywords(test_text)).intersection(bug_words)
+    return min(len(overlap) * 3, 10)
+
+def score_color(score):
+    if score >= 80: return "#16a34a"
+    if score >= 60: return "#84cc16"
+    if score >= 40: return "#facc15"
+    if score >= 20: return "#fb923c"
+    return "#ef4444"
+
+def generate_jql(items):
+    return f"issuekey in ({','.join([t['id'] for t in items])})" if items else ""
+
+def render_card(item, highlight=False):
+    color = score_color(item["score"])
+    text = item["text"]
+    if highlight:
+        text = highlight_manual(text)
+
+    return f"""
+    <div class="card">
+        <b>{item['id']}</b>
+        <span class="score-pill" style="background:{color};color:black;">
+            {item['score']:.2f}%
+        </span>
+        <div style="margin-top:6px;opacity:.85">
+            {text}
+        </div>
+        <div class="progress-bar" style="width:{item['score']}%;background:{color};"></div>
+    </div>
+    """
+
+# ================= MANUAL PRIORITIZE =================
+
+def add_manual_keyword():
+    if not manual_mode:
+        return
+    kw = st.session_state.manual_input.strip().lower()
+    if kw and kw not in st.session_state.manual_keywords:
+        st.session_state.manual_keywords.append(kw)
+    st.session_state.manual_input = ""
+
+st.subheader("🖐 Manual Prioritization")
+
+col1, col2 = st.columns([5,1])
+
+with col1:
+    st.text_input("Add keyword", key="manual_input", disabled=not manual_mode)
+
+with col2:
+    st.button("Add", on_click=add_manual_keyword, disabled=not manual_mode)
+
+for kw in st.session_state.manual_keywords:
+    c1, c2 = st.columns([6,1])
+    c1.markdown(f"🔖 {kw}")
+    if c2.button("❌", key=f"remove_{kw}", disabled=not manual_mode):
+        st.session_state.manual_keywords.remove(kw)
+        st.rerun()
+
+# ================= INPUT =================
+
+c1, c2 = st.columns(2)
+
+with c1:
+    user_story = st.text_area("User Story", height=200)
+
+with c2:
+    acceptance = st.text_area("Acceptance Criteria", height=200)
+
+uploaded_tests = st.file_uploader("Upload Regression Suite CSV/XLSX", type=["csv","xlsx"])
+
+uploaded_bugs = st.file_uploader(
+    "Upload Sprint Bugs CSV/XLSX",
+    type=["csv","xlsx"],
+    disabled=not use_bugs
+)
+
+# ================= ANALYZE =================
+
+if st.button("🚀 Analyze", use_container_width=True):
+
+    if not user_story or not acceptance or not uploaded_tests:
+        st.warning("Provide required inputs")
+        st.stop()
+
+    tests = load_tests(uploaded_tests)
+    bugs = load_bugs(uploaded_bugs if use_bugs else None)
+
+    focus_terms = extract_focus_terms(user_story + " " + acceptance)
+
+    ranked = semantic_rank(clean(user_story + " " + acceptance), tests)
+
+    for t in ranked:
+        t["kw"] = keyword_score(t["text"], focus_terms)
+
+        if use_bugs and bugs:
+            t["bug"] = bug_score(t["text"], [b["text"] for b in bugs])
+        else:
+            t["bug"] = 0
+
+        if manual_mode and any(k in t["text"].lower() for k in st.session_state.manual_keywords):
+            t["manual"] = 10
+        else:
+            t["manual"] = 0
+
+        t["final"] = round(
+            t["semantic"] * 0.4 +
+            t["kw"] +
+            t["bug"] +
+            t["manual"],
+            2
+        )
+
+    ranked = sorted(ranked, key=lambda x: x["final"], reverse=True)
+
+    st.session_state.priority = [t for t in ranked if t["final"] >= threshold]
+    st.session_state.gaps = [t for t in ranked if t["final"] < threshold]
+
+    related = []
+
+    for bug in bugs:
+        kw_score = 0
+        for k, freq in focus_terms.items():
+            if k in bug["text"].lower():
+                kw_score += freq
+
+        kw_score = min(kw_score * 3, 70)
+
+        emb = model.encode([acceptance, bug["text"]])
+        sem = cosine_similarity([emb[0]], [emb[1]])[0][0] * 30
+
+        final = round(kw_score + sem, 2)
+
+        related.append({
+            "id": bug["id"],
+            "text": bug["text"],
+            "score": final
+        })
+
+    st.session_state.related_bugs = sorted(related, key=lambda x: x["score"], reverse=True)
+
+# ================= JQL =================
+
+jql = generate_jql(st.session_state.priority)
+if jql:
+    st.subheader("📋 Priority JQL")
+    st.code(jql)
+
+# ================= OUTPUT =================
+
+left, right = st.columns(2)
+
+with left:
+    st.subheader("✅ Prioritized")
+    with st.container(height=400):
+        for i,t in enumerate(st.session_state.priority):
+            st.markdown(render_card({
+                "id": t["id"],
+                "text": t["text"],
+                "score": t["final"]
+            }, highlight=True), unsafe_allow_html=True)
+
+            if st.button("→ Gaps", key=f"p{i}"):
+                st.session_state.gaps.append(t)
+                st.session_state.priority.remove(t)
+                st.rerun()
+
+with right:
+    st.subheader("⚠ Coverage Gaps")
+    with st.container(height=400):
+        for i,t in enumerate(st.session_state.gaps):
+            st.markdown(render_card({
+                "id": t["id"],
+                "text": t["text"],
+                "score": t["final"]
+            }, highlight=True), unsafe_allow_html=True)
+
+            if st.button("→ Priority", key=f"g{i}"):
+                st.session_state.priority.append(t)
+                st.session_state.gaps.remove(t)
+                st.rerun()
+
+st.markdown("---")
+st.subheader("🐞 Related Bugs")
+
+with st.container(height=400):
+    if use_bugs:
+        for bug in st.session_state.related_bugs:
+            st.markdown(render_card(bug), unsafe_allow_html=True)
